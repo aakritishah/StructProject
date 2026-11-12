@@ -25,6 +25,10 @@ ap.add_argument("--patience", type=int, default=6)
 ap.add_argument("--bs", type=int, default=16)
 ap.add_argument("--lr", type=float, default=2e-4, help="learning rate for backbone params that are trainable")
 ap.add_argument("--head_lr", type=float, default=1e-3)
+ap.add_argument("--modules", default="qv", choices=["qv", "all", "last4"],
+                help="where LoRA goes: qv = attention query+value (default), all = every attention + MLP linear layer, last4 = qv in the last 4 layers only")
+ap.add_argument("--train_frac", type=float, default=1.0, help="use only this fraction of the training rows (learning curve)")
+ap.add_argument("--only_target", default=None, choices=TARGETS, help="single-task: train and predict this target only")
 ap.add_argument("--data", default="data/kras_ddg.csv")
 ap.add_argument("--out_dir", default="results/preds")
 a = ap.parse_args()
@@ -46,11 +50,17 @@ val_g = set(rng.choice(ug, size=max(1, int(0.15 * len(ug))), replace=False))
 is_val = np.array([g in val_g for g in groups])
 val_idx, train_idx = trainval_idx[is_val], trainval_idx[~is_val]
 
+if a.train_frac < 1.0:
+    train_idx = np.random.RandomState(1000 + a.seed).choice(train_idx, size=int(round(a.train_frac * len(train_idx))), replace=False)
+
 Y = df[TARGETS].values.astype(np.float32)
 mu = np.nanmean(Y[train_idx], 0); sd = np.nanstd(Y[train_idx], 0) + 1e-6     # per-target standardisation
 Yz = (Y - mu) / sd
 M = (~np.isnan(Yz)).astype(np.float32)
 Yz = np.nan_to_num(Yz)
+if a.only_target:                                    # single-task ablation: other targets are masked out of loss and output
+    keep = TARGETS.index(a.only_target)
+    M[:, [j for j in range(len(TARGETS)) if j != keep]] = 0
 IDS = torch.tensor([variant_ids(WT_SEQ, r.pos, r.mut) for r in df.itertuples()])
 POS = torch.tensor(df["pos"].values)
 Yz_t, M_t = torch.tensor(Yz), torch.tensor(M)
@@ -59,8 +69,15 @@ Yz_t, M_t = torch.tensor(Yz), torch.tensor(M)
 backbone = load_model(a.model)
 if a.mode == "lora":
     from peft import LoraConfig, get_peft_model
-    cfg = LoraConfig(r=a.rank, lora_alpha=a.alpha, lora_dropout=0.05, bias="none",
-                     target_modules=["query", "value"])
+    n_layers = backbone.config.num_hidden_layers
+    if a.modules == "all":      # explicit regex so the (unused) pooler is not touched
+        tm = r".*encoder\.layer\.\d+\.(attention\.self\.(query|key|value)|attention\.output\.dense|intermediate\.dense|output\.dense)"
+        extra = {}
+    elif a.modules == "last4":
+        tm = ["query", "value"]; extra = dict(layers_to_transform=list(range(max(0, n_layers - 4), n_layers)), layers_pattern="layer")
+    else:
+        tm = ["query", "value"]; extra = {}
+    cfg = LoraConfig(r=a.rank, lora_alpha=a.alpha, lora_dropout=0.05, bias="none", target_modules=tm, **extra)
     backbone = get_peft_model(backbone, cfg)
 elif a.mode == "head":
     for p in backbone.parameters():
@@ -150,6 +167,12 @@ load_state(best_state)
 # ---------------------------------------------------------------- predict held-out fold
 pred = run_eval(test_idx).numpy() * sd + mu
 method = f"{a.mode}_{a.model}" + (f"_r{a.rank}" if a.mode == "lora" else "")
+if a.mode == "lora" and a.modules != "qv":
+    method += f"_{a.modules}"
+if a.train_frac < 1.0:
+    method += f"_frac{int(round(100 * a.train_frac))}"
+if a.only_target:
+    method += f"_only_{a.only_target}"
 rows = []
 for j, t in enumerate(TARGETS):
     for k, i in enumerate(test_idx):
@@ -159,5 +182,5 @@ for j, t in enumerate(TARGETS):
 os.makedirs(a.out_dir, exist_ok=True)
 path = os.path.join(a.out_dir, f"{method}_{a.split}_f{a.fold}_s{a.seed}.csv")
 write_preds(rows, path)
-sp = {t: spearman(*zip(*[(r["y_true"], r["y_pred"]) for r in rows if r["target"] == t])) for t in MAIN_TARGETS}
+sp = {t: spearman(*zip(*[(r["y_true"], r["y_pred"]) for r in rows if r["target"] == t])) for t in MAIN_TARGETS if any(r["target"] == t for r in rows)}
 print("held-out Spearman:", {k: round(v, 3) for k, v in sp.items()}, "->", path)

@@ -5,7 +5,7 @@ export PROJ=$HOME/kras_esm
 export ENV_NAME=struct
 export CONDA_SH=$HOME/miniconda3/etc/profile.d/conda.sh
 # ESM-2 size: use 150M while developing, 650M for the final runs
-export MODEL=150M
+export MODEL=${MODEL:-150M}
 
 # ---- Pitt CRC (what worked for Boltz/BoltzGen): GPU jobs on the "gpu" cluster ----
 export GPU_FLAGS="-M gpu -p l40s --gres=gpu:1"        # or: -p a100
